@@ -111,7 +111,19 @@ def _find_header_row(rows: list[list[Any]]) -> int | None:
     return None
 
 
-def _parse_grid_sheet(rows: list[list[Any]]) -> pd.DataFrame:
+def _trip_type_value(service_value: Any, trip_value: Any) -> str | None:
+    service = str(service_value).strip() if not is_blank(service_value) else ""
+    trip = str(trip_value).strip() if not is_blank(trip_value) else ""
+    if not trip:
+        return service or None
+    if not service:
+        return trip
+    return f"{trip} {service}"
+
+
+def _parse_grid_sheet(
+    rows: list[list[Any]], *, roundtrip_as_row: bool = False
+) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
 
@@ -183,10 +195,12 @@ def _parse_grid_sheet(rows: list[list[Any]]) -> pd.DataFrame:
             or is_roundtrip_trip(trip_val)
             or is_roundtrip_rate_group(rate_group)
         )
+        service_val = _cell(row, extra.get("_service"))
+        trip_type = _trip_type_value(service_val, trip_val) if roundtrip_as_row else None
 
         lane_desc_parts: list[str] = []
         if extra.get("_service") is not None:
-            v = _cell(row, extra["_service"])
+            v = service_val
             if not is_blank(v):
                 lane_desc_parts.append(f"Service: {v}")
         if extra.get("_tt") is not None:
@@ -234,6 +248,7 @@ def _parse_grid_sheet(rows: list[list[Any]]) -> pd.DataFrame:
             "price_per": _cell(row, meta_cols.get("price_per")),
             "equipment_type": _cell(row, meta_cols.get("equipment_type")),
             "roundtrip": is_roundtrip,
+            "trip_type": trip_type,
         }
 
         if not price_cols:
@@ -244,7 +259,7 @@ def _parse_grid_sheet(rows: list[list[Any]]) -> pd.DataFrame:
                 continue
             if isinstance(price, str) and normalize_header(price) in ("true", "false"):
                 continue
-            if is_roundtrip and len(price_cols) == 1:
+            if is_roundtrip and len(price_cols) == 1 and not roundtrip_as_row:
                 rate_label = "Roundtrip"
             else:
                 rate_label = default_rate_label
@@ -263,8 +278,10 @@ def _parse_grid_sheet(rows: list[list[Any]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def convert_file(path: Path, sheets: list[str] | None = None) -> pd.DataFrame:
+def convert_file(
+    path: Path, sheets: list[str] | None = None, *, roundtrip_as_row: bool = False
+) -> pd.DataFrame:
     """Deprecated: use converters.new_grid.convert_file."""
     from converters.new_grid import convert_file as _convert
 
-    return _convert(path, sheets=sheets)
+    return _convert(path, sheets=sheets, roundtrip_as_row=roundtrip_as_row)
