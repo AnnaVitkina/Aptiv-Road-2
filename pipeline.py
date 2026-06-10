@@ -23,8 +23,11 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import pandas as pd
 
 
 def _bootstrap_project_path() -> Path | None:
@@ -39,7 +42,7 @@ def _bootstrap_project_path() -> Path | None:
         pass
     candidates.extend(
         [
-            Path("/content/Aptiv-Road-2"),
+            Path("/content/Aptiv_Road"),
             Path("/content/drive/MyDrive/Aptiv_Road"),
             Path.cwd(),
         ]
@@ -69,7 +72,10 @@ from common import (
     append_excel_sheet,
     copy_excel_sheet,
     get_sheet_names,
+    is_blank,
+    normalize_header,
     output_path,
+    read_sheet_rows,
     save_dataframe,
 )
 from converters import CONVERTERS, LAYOUT_LABELS
@@ -161,19 +167,202 @@ def _list_excel_files(layout: str) -> list[Path]:
     return sorted(files, key=lambda p: p.name.lower())
 
 
+_DATE_TOKEN_RE = re.compile(
+    r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\b"
+)
+_NEW_LANE_RE = re.compile(r"new\s+lane\s+(.+?)\s+add(?:ed)?\b", re.I)
+_LANE_CODE_RE = re.compile(r"^\s*([A-Za-z]{2})\s*[-\s]*([0-9A-Za-z]+)\s*[-\s]*([A-Za-z]{2})\s*[-\s]*([0-9A-Za-z]+)\s*$")
+
+
+def _normalize_lane_key(value: object) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^A-Za-z0-9]+", "", str(value)).upper()
+
+
+def _parse_any_date(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in (
+        "%d.%m.%Y",
+        "%d.%m.%y",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%d/%m/%Y",
+        "%d/%m/%y",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _format_date_ddmmyyyy(value: object) -> str | None:
+    dt = _parse_any_date(value)
+    if dt is None:
+        return None
+    return dt.strftime("%d.%m.%Y")
+
+
+def _normalize_country(value: object) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^A-Za-z]+", "", str(value)).upper()
+
+
+def _normalize_postal(value: object) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^0-9A-Za-z]+", "", str(value)).upper()
+
+
+def _parse_lane_code(value: object) -> tuple[str, str, str, str] | None:
+    if value is None:
+        return None
+    m = _LANE_CODE_RE.match(str(value).strip())
+    if not m:
+        return None
+    return (
+        _normalize_country(m.group(1)),
+        _normalize_postal(m.group(2)),
+        _normalize_country(m.group(3)),
+        _normalize_postal(m.group(4)),
+    )
+
+
+def _extract_ratebook_validity(source: Path) -> tuple[str | None, str | None]:
+    for sheet in get_sheet_names(source):
+        rows = read_sheet_rows(source, sheet, as_displayed=True)
+        scan_limit = min(40, len(rows))
+        for i in range(scan_limit):
+            row = rows[i]
+            row_text = " | ".join(str(c).strip() for c in row if not is_blank(c))
+            if "rate book -valid from" not in normalize_header(row_text):
+                continue
+            dates = _DATE_TOKEN_RE.findall(row_text)
+            if len(dates) >= 2:
+                start = _format_date_ddmmyyyy(dates[0])
+                end = _format_date_ddmmyyyy(dates[1])
+                if start or end:
+                    return start, end
+            for j in range(i + 1, min(i + 4, scan_limit)):
+                near_text = " | ".join(
+                    str(c).strip() for c in rows[j] if not is_blank(c)
+                )
+                dates = _DATE_TOKEN_RE.findall(near_text)
+                if len(dates) >= 2:
+                    start = _format_date_ddmmyyyy(dates[0])
+                    end = _format_date_ddmmyyyy(dates[1])
+                    if start or end:
+                        return start, end
+    return None, None
+
+
+def _extract_latest_revision_lane_effective_date(
+    source: Path,
+) -> tuple[str | None, str | None]:
+    revision_sheet = next(
+        (s for s in get_sheet_names(source) if "revision" in normalize_header(s)),
+        None,
+    )
+    if revision_sheet is None:
+        return None, None
+
+    rows = read_sheet_rows(source, revision_sheet, as_displayed=True)
+    if not rows:
+        return None, None
+
+    header_idx: int | None = None
+    effective_col: int | None = None
+    for i in range(min(20, len(rows))):
+        for col_i, cell in enumerate(rows[i]):
+            if "effective date" in normalize_header(cell):
+                header_idx = i
+                effective_col = col_i
+                break
+        if effective_col is not None:
+            break
+
+    if effective_col is None:
+        return None, None
+
+    for r in range(len(rows) - 1, (header_idx or 0), -1):
+        row = rows[r]
+        if not any(not is_blank(c) for c in row):
+            continue
+        text = " | ".join(str(c).strip() for c in row if not is_blank(c))
+        m = _NEW_LANE_RE.search(text)
+        if not m:
+            continue
+        lane_key = _normalize_lane_key(m.group(1))
+        if not lane_key:
+            continue
+        effective_val = row[effective_col] if effective_col < len(row) else None
+        valid_from = _format_date_ddmmyyyy(effective_val)
+        if valid_from:
+            return lane_key, valid_from
+    return None, None
+
+
+def _apply_validity_columns(df: pd.DataFrame, source: Path) -> pd.DataFrame:
+    out = df.copy()
+    default_valid_from, default_valid_to = _extract_ratebook_validity(source)
+    out["valid_from"] = default_valid_from
+    out["valid_to"] = default_valid_to
+
+    lane_key, lane_valid_from = _extract_latest_revision_lane_effective_date(source)
+    if lane_key and lane_valid_from and "lane_id" in out.columns:
+        lane_keys = out["lane_id"].apply(_normalize_lane_key)
+        exact_mask = lane_keys == lane_key
+        contains_mask = lane_keys.apply(
+            lambda k: bool(k) and (lane_key in k or k in lane_key)
+        )
+        target_mask = exact_mask | contains_mask
+
+        parsed_code = _parse_lane_code(lane_key)
+        if parsed_code is not None:
+            o_country, o_postal, d_country, d_postal = parsed_code
+            by_fields = pd.Series(True, index=out.index)
+            if "origin_country" in out.columns:
+                by_fields &= out["origin_country"].apply(_normalize_country) == o_country
+            if "origin_zip" in out.columns:
+                by_fields &= out["origin_zip"].apply(_normalize_postal) == o_postal
+            if "dest_country" in out.columns:
+                by_fields &= out["dest_country"].apply(_normalize_country) == d_country
+            if "dest_zip" in out.columns:
+                by_fields &= out["dest_zip"].apply(_normalize_postal) == d_postal
+            target_mask = target_mask | by_fields
+
+        out.loc[target_mask, "valid_from"] = lane_valid_from
+    return out
+
+
 def convert_one(
     layout: str,
     source: Path,
     *,
     sheets: list[str] | None = None,
     sheet_configs: dict | None = None,
+    new_grid_roundtrip_as_row: bool = False,
+    include_validity_columns: bool = False,
 ) -> Path | None:
     """Convert one workbook to long-format *_converted.xlsx under processing/."""
     layout_key = config.normalize_layout(layout)
     converter = CONVERTERS[layout_key]
     kwargs: dict = {}
-    if config.normalize_layout(layout) == "usual_rate" and sheet_configs:
+    layout_key = config.normalize_layout(layout)
+    if layout_key == "usual_rate" and sheet_configs:
         kwargs["sheet_configs"] = sheet_configs
+    if layout_key == "new_grid":
+        kwargs["roundtrip_as_row"] = new_grid_roundtrip_as_row
     try:
         df = converter(source, sheets=sheets, **kwargs)
     except ValueError as exc:
@@ -183,6 +372,8 @@ def convert_one(
     if df.empty:
         print(f"  WARNING: No price rows — {source.name}")
         return None
+    if include_validity_columns:
+        df = _apply_validity_columns(df, source)
 
     dest = output_path(config.PROCESSING_DIR, layout_key, source)
     save_dataframe(df, dest)
@@ -265,6 +456,8 @@ def process_one_workbook(
     *,
     sheets: list[str] | None = None,
     sheet_configs: dict | None = None,
+    new_grid_roundtrip_as_row: bool = False,
+    include_validity_columns: bool = False,
     prompt_accessorial: bool = True,
     export_matrix: bool = True,
     input_fn=None,
@@ -279,7 +472,14 @@ def process_one_workbook(
     print(f"\n{'=' * 60}\n  Processing: {source.name}\n{'=' * 60}")
 
     print("\n--- Step 1/3: Convert main rates ---")
-    dest = convert_one(layout, source, sheets=sheets, sheet_configs=sheet_configs)
+    dest = convert_one(
+        layout,
+        source,
+        sheets=sheets,
+        sheet_configs=sheet_configs,
+        new_grid_roundtrip_as_row=new_grid_roundtrip_as_row,
+        include_validity_columns=include_validity_columns,
+    )
     if dest is None:
         result.skipped = True
         return result
@@ -529,23 +729,37 @@ def run_full_processing() -> PipelineResult:
         for path in selected:
             sheets: list[str] | None = None
             sheet_configs = None
+            new_grid_roundtrip_as_row = False
+            include_validity_columns = False
             if len(selected) == 1:
                 print(f"\n--- Rate tabs for {path.name} ---")
                 sheets = _choose_sheets(path)
                 if sheets == []:
                     continue
-                if config.normalize_layout(layout) == "usual_rate":
+                layout_key = config.normalize_layout(layout)
+                if layout_key == "usual_rate":
                     from converters.usual_rate import gather_column_overrides
 
                     sheet_configs = gather_column_overrides(
                         path, sheets, input_fn=_prompt
                     )
+                if layout_key == "new_grid":
+                    rt_choice = _prompt(
+                        "Roundtrip in matrix: cost column or shipment row? [column/row]: "
+                    ).strip().lower()
+                    new_grid_roundtrip_as_row = rt_choice in ("row", "r")
+                validity_choice = _prompt(
+                    "Add validity columns (Valid From / Valid To)? [y/N]: "
+                ).strip().lower()
+                include_validity_columns = validity_choice in ("y", "yes")
 
             wb = process_one_workbook(
                 layout,
                 path,
                 sheets=sheets,
                 sheet_configs=sheet_configs,
+                new_grid_roundtrip_as_row=new_grid_roundtrip_as_row,
+                include_validity_columns=include_validity_columns,
                 prompt_accessorial=True,
                 export_matrix=True,
             )
