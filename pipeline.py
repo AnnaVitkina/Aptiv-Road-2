@@ -42,7 +42,7 @@ def _bootstrap_project_path() -> Path | None:
         pass
     candidates.extend(
         [
-            Path("/content/Aptiv_Road"),
+            Path("/content/Aptiv-Road-2"),
             Path("/content/drive/MyDrive/Aptiv_Road"),
             Path.cwd(),
         ]
