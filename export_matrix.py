@@ -48,6 +48,9 @@ SHIPMENT_COLUMN_MAP: OrderedDict[str, str] = OrderedDict(
         ("dest_zip", "Destination Postal Code"),
         ("dest_city", "Destination City"),
         ("rate_group", "Service"),
+        ("trip_type", "Trip Type"),
+        ("valid_from", "Valid From"),
+        ("valid_to", "Valid To"),
         ("equipment_type", "Equipment Type"),
         ("price_per", "Price Per"),
     ]
@@ -1047,6 +1050,9 @@ def _is_ftl_style_rate_group(rate_group: Any) -> bool:
 
 def _is_equipment_courier_grid(df: pd.DataFrame) -> bool:
     """Equipment-type price columns with roundtrip carried in Trip Type / Service."""
+    if "trip_type" in df.columns and _column_has_values(df, "trip_type"):
+        # Roundtrip is explicitly modeled as a shipment row dimension.
+        return False
     if _is_bracket_equipment_hybrid(df):
         return False
     if _is_open_bracket_transport_grid(df):
