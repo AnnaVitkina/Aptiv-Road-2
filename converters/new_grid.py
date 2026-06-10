@@ -13,11 +13,13 @@ from converters.schema import USUAL_RATE_DATA_COLUMNS
 LAYOUT_KEY = "new_grid"
 
 
-def convert_file(path: Path, sheets: list[str] | None = None) -> pd.DataFrame:
+def convert_file(
+    path: Path, sheets: list[str] | None = None, *, roundtrip_as_row: bool = False
+) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for sheet in sheets_to_convert(path, sheets=sheets, auto_include=_is_price_tab):
         rows = read_sheet_rows(path, sheet, as_displayed=True)
-        df = _parse_grid_sheet(rows)
+        df = _parse_grid_sheet(rows, roundtrip_as_row=roundtrip_as_row)
         if df.empty:
             continue
         frames.append(
