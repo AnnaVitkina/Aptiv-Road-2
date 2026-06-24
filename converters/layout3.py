@@ -111,9 +111,18 @@ def _find_header_row(rows: list[list[Any]]) -> int | None:
     return None
 
 
+def _trip_type_label(value: str) -> str:
+    """Title-case trip/service labels (e.g. ONE WAY -> One Way)."""
+    return " ".join(word.capitalize() for word in re.sub(r"\s+", " ", value.strip()).split())
+
+
 def _trip_type_value(service_value: Any, trip_value: Any) -> str | None:
-    service = str(service_value).strip() if not is_blank(service_value) else ""
-    trip = str(trip_value).strip() if not is_blank(trip_value) else ""
+    service = (
+        _trip_type_label(str(service_value))
+        if not is_blank(service_value)
+        else ""
+    )
+    trip = _trip_type_label(str(trip_value)) if not is_blank(trip_value) else ""
     if not trip:
         return service or None
     if not service:
